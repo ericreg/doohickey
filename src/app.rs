@@ -1,7 +1,8 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::io;
 use std::process::ExitCode;
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 use block2::RcBlock;
 use objc2::rc::{Retained, Weak, autoreleasepool};
@@ -72,7 +73,7 @@ impl Shortcut {
         match (character, flags.contains(NSEventModifierFlags::Shift)) {
             (NSCarriageReturnCharacter | NSEnterCharacter, true) => Some(Self::Add),
             (NSCarriageReturnCharacter | NSEnterCharacter, false) => Some(Self::Toggle),
-            (NSDeleteFunctionKey, false) => Some(Self::Delete),
+            (NSDeleteFunctionKey, true) => Some(Self::Delete),
             (NSUpArrowFunctionKey, false) => Some(Self::Up),
             (NSDownArrowFunctionKey, false) => Some(Self::Down),
             _ => None,
@@ -81,15 +82,15 @@ impl Shortcut {
 }
 
 struct Panel {
-    store: RefCell<Store>,
+    store: Rc<RefCell<Store>>,
     popover: Retained<NSPopover>,
     root: Retained<ContentView>,
-    editor: Retained<NSTextField>,
-    count: Retained<NSTextField>,
+    editor: OnceCell<Retained<NSTextField>>,
     scroll: Retained<NSScrollView>,
     list: Retained<ContentView>,
     empty: Retained<NSTextField>,
     footer: Retained<ContentView>,
+    trash_image: Retained<NSImage>,
     rows: RefCell<Vec<TaskRow>>,
     editing_name: RefCell<Option<Retained<NSButton>>>,
     current_row: Cell<Option<usize>>,
@@ -144,6 +145,107 @@ impl TaskRow {
     }
 }
 
+struct MenuBarState {
+    store: Rc<RefCell<Store>>,
+    panel: RefCell<Option<Retained<Controller>>>,
+    scroll_origin: Cell<NSPoint>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "DoohickeyMenuBar"]
+    #[ivars = MenuBarState]
+    struct MenuBar;
+
+    unsafe impl NSObjectProtocol for MenuBar {}
+
+    unsafe impl NSApplicationDelegate for MenuBar {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn should_terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
+            if self.panel().is_none_or(|panel| panel.end_edit(true)) {
+                NSApplicationTerminateReply::TerminateNow
+            } else {
+                NSApplicationTerminateReply::TerminateCancel
+            }
+        }
+    }
+
+    unsafe impl NSPopoverDelegate for MenuBar {
+        #[unsafe(method(popoverDidShow:))]
+        fn popover_did_show(&self, _note: &NSNotification) {
+            if let Some(panel) = self.panel() {
+                panel.install_shortcuts();
+            }
+        }
+
+        #[unsafe(method(popoverWillClose:))]
+        fn popover_will_close(&self, _note: &NSNotification) {
+            if let Some(panel) = self.panel() {
+                if let Some(monitor) = panel.ivars().shortcut_monitor.take() {
+                    unsafe { NSEvent::removeMonitor(&monitor) };
+                }
+                self.ivars().scroll_origin.set(panel.ivars().scroll.documentVisibleRect().origin);
+                panel.end_edit(true);
+            }
+        }
+
+        #[unsafe(method(popoverDidClose:))]
+        fn popover_did_close(&self, _note: &NSNotification) {
+            // A failed save leaves the editor attached, even while its alert is running.
+            if let Some(controller) = self.panel() {
+                let panel = controller.ivars();
+                if !panel.editor.get().is_some_and(|field| field.isDescendantOf(&panel.list)) {
+                    self.ivars().panel.take();
+                }
+            }
+        }
+    }
+
+    impl MenuBar {
+        #[unsafe(method(togglePopover:))]
+        fn toggle_popover(&self, button: &NSStatusBarButton) {
+            let controller = self.panel().unwrap_or_else(|| {
+                let controller = Controller::new(self.mtm(), self.ivars().store.clone());
+                controller.ivars().popover.setDelegate(Some(ProtocolObject::from_ref(self)));
+                self.ivars().panel.replace(Some(controller.clone()));
+                controller
+            });
+            let panel = controller.ivars();
+            if panel.popover.isShown() {
+                panel.popover.close();
+            } else {
+                NSApplication::sharedApplication(self.mtm()).activate();
+                panel.popover.showRelativeToRect_ofView_preferredEdge(
+                    button.bounds(), button, NSRectEdge::MinY,
+                );
+                panel.list.scrollPoint(self.ivars().scroll_origin.get());
+                if let Some(window) = panel.root.window() {
+                    window.makeKeyWindow();
+                    if panel.editing_name.borrow().is_some() {
+                        window.makeFirstResponder(Some(controller.editor()));
+                    }
+                }
+            }
+        }
+    }
+);
+
+impl MenuBar {
+    fn new(mtm: MainThreadMarker, store: Store) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(MenuBarState {
+            store: Rc::new(RefCell::new(store)),
+            panel: RefCell::default(),
+            scroll_origin: Cell::new(NSPoint::ZERO),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn panel(&self) -> Option<Retained<Controller>> {
+        self.ivars().panel.borrow().clone()
+    }
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -170,55 +272,7 @@ define_class!(
         }
     }
 
-    unsafe impl NSPopoverDelegate for Controller {
-        #[unsafe(method(popoverDidShow:))]
-        fn popover_did_show(&self, _note: &NSNotification) {
-            self.install_shortcuts();
-        }
-
-        #[unsafe(method(popoverWillClose:))]
-        fn popover_will_close(&self, _note: &NSNotification) {
-            if let Some(monitor) = self.ivars().shortcut_monitor.take() {
-                unsafe { NSEvent::removeMonitor(&monitor) };
-            }
-            if self.end_edit(true) {
-                self.ivars().current_row.set(None);
-            }
-        }
-    }
-
-    unsafe impl NSApplicationDelegate for Controller {
-        #[unsafe(method(applicationShouldTerminate:))]
-        fn should_terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
-            if self.end_edit(true) {
-                NSApplicationTerminateReply::TerminateNow
-            } else {
-                NSApplicationTerminateReply::TerminateCancel
-            }
-        }
-    }
-
     impl Controller {
-        #[unsafe(method(togglePopover:))]
-        fn toggle_popover(&self, button: &NSStatusBarButton) {
-            let panel = self.ivars();
-            if panel.popover.isShown() {
-                panel.popover.close();
-            } else {
-                let app = NSApplication::sharedApplication(self.mtm());
-                app.activate();
-                panel.popover.showRelativeToRect_ofView_preferredEdge(
-                    button.bounds(), button, NSRectEdge::MinY,
-                );
-                if let Some(window) = panel.root.window() {
-                    window.makeKeyWindow();
-                    if panel.editing_name.borrow().is_some() {
-                        window.makeFirstResponder(Some(&panel.editor));
-                    }
-                }
-            }
-        }
-
         #[unsafe(method(addTask:))]
         fn add_task(&self, _sender: &NSControl) {
             self.add_empty_row();
@@ -245,7 +299,6 @@ define_class!(
                 panel.current_row.set(Some(index));
                 panel.rows.borrow()[index].show_task(task);
             }
-            self.update_count();
             if let Err(error) = result {
                 show_error(self.mtm(), "Couldn’t update this task", &error);
             }
@@ -261,6 +314,22 @@ define_class!(
             }
         }
 
+        #[unsafe(method(copyList:))]
+        fn copy_list(&self, _sender: &NSButton) {
+            if !self.end_edit(true) {
+                return;
+            }
+            let markdown = markdown_checklist(self.ivars().store.borrow().tasks());
+            if markdown.is_empty() {
+                return;
+            }
+            let board = NSPasteboard::generalPasteboard();
+            board.clearContents();
+            if !board.setString_forType(&NSString::from_str(&markdown), unsafe { NSPasteboardTypeString }) {
+                show_error(self.mtm(), "Couldn’t copy the list", &io::Error::other("The clipboard is unavailable."));
+            }
+        }
+
         #[unsafe(method(showOptions:))]
         fn show_options(&self, sender: &NSButton) {
             let menu = quit_menu(self.mtm());
@@ -270,18 +339,8 @@ define_class!(
 );
 
 impl Controller {
-    fn new(mtm: MainThreadMarker, store: Store) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, store: Rc<RefCell<Store>>) -> Retained<Self> {
         let root = ContentView::new(mtm, rect(0.0, 0.0, WIDTH, 150.0));
-        let editor = NSTextField::textFieldWithString(ns_string!(""), mtm);
-        editor.setPlaceholderString(Some(ns_string!("New task")));
-        editor.setAccessibilityLabel(Some(ns_string!("Task name")));
-        editor.setBezeled(false);
-        editor.setBordered(false);
-        editor.setDrawsBackground(false);
-        editor.setFocusRingType(NSFocusRingType::None);
-        editor.setUsesSingleLineMode(true);
-        editor.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-
         let scroll = NSScrollView::new(mtm);
         scroll.setDrawsBackground(false);
         scroll.setHasVerticalScroller(true);
@@ -297,14 +356,6 @@ impl Controller {
         list.addSubview(&empty);
 
         let footer = ContentView::new(mtm, NSRect::ZERO);
-        let count = NSTextField::labelWithString(ns_string!(""), mtm);
-        count.setAlignment(NSTextAlignment::Right);
-        count.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        count.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
-            12.0, 0.0,
-        )));
-        count.setFrame(rect(WIDTH - 146.0, 9.0, 102.0, 17.0));
-        footer.addSubview(&count);
         root.addSubview(&footer);
 
         let view_controller = NSViewController::new(mtm);
@@ -314,15 +365,15 @@ impl Controller {
         popover.setAnimates(false);
         popover.setContentViewController(Some(&view_controller));
         let this = Self::alloc(mtm).set_ivars(Panel {
-            store: RefCell::new(store),
+            store,
             popover,
             root,
-            editor,
-            count,
+            editor: OnceCell::new(),
             scroll,
             list,
             empty,
             footer,
+            trash_image: symbol("trash"),
             rows: RefCell::default(),
             editing_name: RefCell::default(),
             current_row: Cell::new(None),
@@ -331,19 +382,17 @@ impl Controller {
         // NSObject's designated initializer preserves the initialized Rust ivars.
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         let panel = this.ivars();
-        // run() owns the delegates throughout the event loop.
-        unsafe {
-            panel
-                .editor
-                .setDelegate(Some(ProtocolObject::from_ref(&*this)));
-        }
-        panel
-            .popover
-            .setDelegate(Some(ProtocolObject::from_ref(&*this)));
-        let add = this.icon_button("plus", "Add task", sel!(addTask:));
+        let add = this.icon_button(&symbol("plus"), "Add task", sel!(addTask:));
         add.setFrame(rect(12.0, 3.0, 28.0, 28.0));
         panel.footer.addSubview(&add);
-        let options = this.icon_button("ellipsis.circle", "Options", sel!(showOptions:));
+        let copy = this.icon_button(
+            &symbol("doc.on.doc"),
+            "Copy list as Markdown",
+            sel!(copyList:),
+        );
+        copy.setFrame(rect(WIDTH - 68.0, 4.0, 24.0, 26.0));
+        panel.footer.addSubview(&copy);
+        let options = this.icon_button(&symbol("ellipsis.circle"), "Options", sel!(showOptions:));
         options.setFrame(rect(WIDTH - 40.0, 4.0, 24.0, 26.0));
         panel.footer.addSubview(&options);
         for task in panel.store.borrow().tasks() {
@@ -355,36 +404,17 @@ impl Controller {
         this
     }
 
-    fn icon_button(&self, symbol: &str, label: &str, action: Sel) -> Retained<NSButton> {
+    fn icon_button(&self, image: &NSImage, label: &str, action: Sel) -> Retained<NSButton> {
         let label = NSString::from_str(label);
-        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(symbol),
-            Some(&label),
-        )
-        .expect("the app uses built-in macOS symbols");
         // All button selectors take the sending control as their only argument.
         let button = unsafe {
-            NSButton::buttonWithImage_target_action(&image, Some(self), Some(action), self.mtm())
+            NSButton::buttonWithImage_target_action(image, Some(self), Some(action), self.mtm())
         };
         button.setBordered(false);
         button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
         button.setAccessibilityLabel(Some(&label));
         button.setToolTip(Some(&label));
         button
-    }
-
-    fn update_count(&self) {
-        let panel = self.ivars();
-        let store = panel.store.borrow();
-        let open = store.tasks().iter().filter(|task| !task.done).count();
-        let count = if store.tasks().is_empty() {
-            String::new()
-        } else if open == 0 {
-            "All done".into()
-        } else {
-            format!("{open} open")
-        };
-        panel.count.setStringValue(&NSString::from_str(&count));
     }
 
     fn install_shortcuts(&self) {
@@ -419,7 +449,8 @@ impl Controller {
         };
         let editor = panel
             .editor
-            .currentEditor()
+            .get()
+            .and_then(|field| field.currentEditor())
             .and_then(|editor| editor.downcast::<NSTextView>().ok());
         if editor
             .as_ref()
@@ -580,7 +611,7 @@ impl Controller {
             cell.setWraps(true);
         }
         view.addSubview(&name);
-        let trash = self.icon_button("trash", "Delete task", sel!(deleteTask:));
+        let trash = self.icon_button(&self.ivars().trash_image, "Delete task", sel!(deleteTask:));
         view.addSubview(&trash);
         self.ivars().list.addSubview(&view);
         TaskRow {
@@ -589,6 +620,23 @@ impl Controller {
             name,
             trash,
         }
+    }
+
+    fn editor(&self) -> &NSTextField {
+        self.ivars().editor.get_or_init(|| {
+            let editor = NSTextField::textFieldWithString(ns_string!(""), self.mtm());
+            editor.setPlaceholderString(Some(ns_string!("New task")));
+            editor.setAccessibilityLabel(Some(ns_string!("Task name")));
+            editor.setBezeled(false);
+            editor.setBordered(false);
+            editor.setDrawsBackground(false);
+            editor.setFocusRingType(NSFocusRingType::None);
+            editor.setUsesSingleLineMode(true);
+            editor.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            // The popover controller owns this field throughout editing.
+            unsafe { editor.setDelegate(Some(ProtocolObject::from_ref(self))) };
+            editor
+        })
     }
 
     fn begin_edit(&self, sender: &NSButton, caret: Option<usize>) {
@@ -600,10 +648,9 @@ impl Controller {
             };
             (row.name.clone(), row.view.clone())
         };
-        panel
-            .editor
-            .setStringValue(&name.attributedTitle().string());
-        panel.editor.setFrame(rect(
+        let field = self.editor();
+        field.setStringValue(&name.attributedTitle().string());
+        field.setFrame(rect(
             NAME_X,
             (view.frame().size.height - 18.0) / 2.0,
             NAME_WIDTH,
@@ -612,11 +659,11 @@ impl Controller {
         name.setHidden(true);
         panel.current_row.set(Some(sender.tag() as usize));
         panel.editing_name.replace(Some(name));
-        view.addSubview(&panel.editor);
-        panel.editor.scrollRectToVisible(panel.editor.bounds());
+        view.addSubview(field);
+        field.scrollRectToVisible(field.bounds());
         if let Some(window) = view.window() {
-            window.makeFirstResponder(Some(&panel.editor));
-            if let Some(editor) = panel.editor.currentEditor() {
+            window.makeFirstResponder(Some(field));
+            if let Some(editor) = field.currentEditor() {
                 let text = editor.string();
                 let selection = match caret {
                     None => NSRange::new(0, text.length()),
@@ -640,10 +687,10 @@ impl Controller {
         };
         let index = name.tag() as usize;
         if save {
-            let text = panel
-                .editor
+            let field = self.editor();
+            let text = field
                 .currentEditor()
-                .map_or_else(|| panel.editor.stringValue(), |editor| editor.string());
+                .map_or_else(|| field.stringValue(), |editor| editor.string());
             let result = {
                 let mut store = panel.store.borrow_mut();
                 if index == store.tasks().len() {
@@ -654,7 +701,7 @@ impl Controller {
             };
             if let Err(error) = result {
                 show_error(self.mtm(), "Couldn’t save this task", &error);
-                panel.editor.setStringValue(&text);
+                field.setStringValue(&text);
                 panel.editing_name.replace(Some(name));
                 return false;
             }
@@ -672,7 +719,7 @@ impl Controller {
     }
 
     fn detach_editor(&self) {
-        let editor = &self.ivars().editor;
+        let editor = self.editor();
         editor.abortEditing();
         editor.removeFromSuperview();
     }
@@ -701,8 +748,24 @@ impl Controller {
         let size = NSSize::new(WIDTH, LIST_TOP + visible + 36.0);
         panel.root.setFrameSize(size);
         panel.popover.setContentSize(size);
-        self.update_count();
     }
+}
+
+fn markdown_checklist(tasks: &[Task]) -> String {
+    tasks
+        .iter()
+        .map(|task| {
+            let mark = if task.done { "x" } else { " " };
+            let text = task.text.replace('\n', "\n  ");
+            format!("- [{mark}] {text}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn symbol(name: &str) -> Retained<NSImage> {
+    NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), None)
+        .expect("the app uses built-in macOS symbols")
 }
 
 fn task_title(task: &Task) -> Retained<NSMutableAttributedString> {
@@ -792,10 +855,10 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (_controller, _status) = autoreleasepool(|_| {
+    let (_menu_bar, _status) = autoreleasepool(|_| {
         install_menu(&app, mtm);
-        let controller = Controller::new(mtm, store);
-        app.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
+        let menu_bar = MenuBar::new(mtm, store);
+        app.setDelegate(Some(ProtocolObject::from_ref(&*menu_bar)));
         let status = NSStatusBar::systemStatusBar().statusItemWithLength(NSSquareStatusItemLength);
         let button = status.button(mtm).expect("status item has a button");
         let name = ns_string!("doohickey");
@@ -810,10 +873,10 @@ pub fn run() -> ExitCode {
         button.setAccessibilityLabel(Some(name));
         // The status button is the sender expected by togglePopover:.
         unsafe {
-            button.setTarget(Some(&controller));
+            button.setTarget(Some(&menu_bar));
             button.setAction(Some(sel!(togglePopover:)));
         }
-        (controller, status)
+        (menu_bar, status)
     });
     app.run();
     ExitCode::SUCCESS
@@ -824,20 +887,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn forward_delete_removes_rows_and_backspace_goes_to_the_editor() {
-        let plain = NSEventModifierFlags::empty();
-        for flags in [plain, NSEventModifierFlags::Function] {
-            assert!(Shortcut::from_key(NSDeleteFunctionKey, flags) == Some(Shortcut::Delete));
-            assert!(Shortcut::from_key(NSDeleteCharacter, flags).is_none());
-            assert!(Shortcut::from_key(NSBackspaceCharacter, flags).is_none());
+    fn markdown_preserves_task_order_and_completion() {
+        let tasks = [
+            Task {
+                text: "Read notes".into(),
+                done: true,
+            },
+            Task {
+                text: "Buy café beans\nand milk".into(),
+                done: false,
+            },
+        ];
+        assert_eq!(
+            markdown_checklist(&tasks),
+            "- [x] Read notes\n- [ ] Buy café beans\n  and milk"
+        );
+        assert!(markdown_checklist(&[]).is_empty());
+    }
+
+    #[test]
+    fn row_deletion_requires_shift_and_forward_delete() {
+        let shift = NSEventModifierFlags::Shift;
+        for flags in [
+            NSEventModifierFlags::empty(),
+            NSEventModifierFlags::Function,
+        ] {
+            assert!(Shortcut::from_key(NSDeleteFunctionKey, flags).is_none());
+            assert!(
+                Shortcut::from_key(NSDeleteFunctionKey, shift | flags) == Some(Shortcut::Delete)
+            );
         }
         for modifier in [
             NSEventModifierFlags::Command,
-            NSEventModifierFlags::Option,
             NSEventModifierFlags::Control,
-            NSEventModifierFlags::Shift,
+            NSEventModifierFlags::Option,
         ] {
-            assert!(Shortcut::from_key(NSDeleteFunctionKey, modifier).is_none());
+            assert!(Shortcut::from_key(NSDeleteFunctionKey, shift | modifier).is_none());
+        }
+        for key in [
+            NSDeleteCharacter,
+            NSBackspaceCharacter,
+            NSInsertFunctionKey,
+            NSHelpFunctionKey,
+        ] {
+            assert!(Shortcut::from_key(key, NSEventModifierFlags::empty()).is_none());
+            assert!(Shortcut::from_key(key, shift).is_none());
         }
     }
 }
