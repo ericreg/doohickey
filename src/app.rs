@@ -7,7 +7,7 @@ use std::rc::Rc;
 use block2::RcBlock;
 use objc2::rc::{Retained, Weak, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::*;
 use objc2_foundation::{
     MainThreadMarker, NSMutableAttributedString, NSNotification, NSNumber, NSObject,
@@ -82,6 +82,7 @@ impl Shortcut {
 }
 
 struct Panel {
+    status_button: Retained<NSStatusBarButton>,
     store: Rc<RefCell<Store>>,
     popover: Retained<NSPopover>,
     root: Retained<ContentView>,
@@ -206,7 +207,7 @@ define_class!(
         #[unsafe(method(togglePopover:))]
         fn toggle_popover(&self, button: &NSStatusBarButton) {
             let controller = self.panel().unwrap_or_else(|| {
-                let controller = Controller::new(self.mtm(), self.ivars().store.clone());
+                let controller = Controller::new(self.mtm(), self.ivars().store.clone(), button.retain());
                 controller.ivars().popover.setDelegate(Some(ProtocolObject::from_ref(self)));
                 self.ivars().panel.replace(Some(controller.clone()));
                 controller
@@ -301,6 +302,8 @@ define_class!(
             }
             if let Err(error) = result {
                 show_error(self.mtm(), "Couldn’t update this task", &error);
+            } else {
+                update_task_count(&panel.status_button, &panel.store.borrow());
             }
         }
 
@@ -339,7 +342,11 @@ define_class!(
 );
 
 impl Controller {
-    fn new(mtm: MainThreadMarker, store: Rc<RefCell<Store>>) -> Retained<Self> {
+    fn new(
+        mtm: MainThreadMarker,
+        store: Rc<RefCell<Store>>,
+        status_button: Retained<NSStatusBarButton>,
+    ) -> Retained<Self> {
         let root = ContentView::new(mtm, rect(0.0, 0.0, WIDTH, 150.0));
         let scroll = NSScrollView::new(mtm);
         scroll.setDrawsBackground(false);
@@ -365,6 +372,7 @@ impl Controller {
         popover.setAnimates(false);
         popover.setContentViewController(Some(&view_controller));
         let this = Self::alloc(mtm).set_ivars(Panel {
+            status_button,
             store,
             popover,
             root,
@@ -566,6 +574,7 @@ impl Controller {
                 show_error(self.mtm(), "Couldn’t delete this task", &error);
                 return false;
             }
+            update_task_count(&panel.status_button, &panel.store.borrow());
         }
         if panel
             .editing_name
@@ -694,16 +703,20 @@ impl Controller {
             let result = {
                 let mut store = panel.store.borrow_mut();
                 if index == store.tasks().len() {
-                    store.add(&text.to_string()).map(|_| ())
+                    store.add(&text.to_string())
                 } else {
-                    store.rename(index, &text.to_string())
+                    store.rename(index, &text.to_string()).map(|()| false)
                 }
             };
-            if let Err(error) = result {
-                show_error(self.mtm(), "Couldn’t save this task", &error);
-                field.setStringValue(&text);
-                panel.editing_name.replace(Some(name));
-                return false;
+            match result {
+                Ok(true) => update_task_count(&panel.status_button, &panel.store.borrow()),
+                Ok(false) => (),
+                Err(error) => {
+                    show_error(self.mtm(), "Couldn’t save this task", &error);
+                    field.setStringValue(&text);
+                    panel.editing_name.replace(Some(name));
+                    return false;
+                }
             }
         }
         self.detach_editor();
@@ -841,6 +854,15 @@ fn show_error(mtm: MainThreadMarker, title: &str, error: &io::Error) {
     alert.runModal();
 }
 
+fn update_task_count(button: &NSStatusBarButton, store: &Store) {
+    let open = store.tasks().iter().filter(|task| !task.done).count();
+    let noun = if open == 1 { "task" } else { "tasks" };
+    let label = NSString::from_str(&format!("doohickey, {open} open {noun}"));
+    button.setTitle(&NSString::from_str(&open.to_string()));
+    button.setToolTip(Some(&label));
+    button.setAccessibilityLabel(Some(&label));
+}
+
 pub fn run() -> ExitCode {
     let mtm = MainThreadMarker::new().expect("AppKit must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -859,7 +881,8 @@ pub fn run() -> ExitCode {
         install_menu(&app, mtm);
         let menu_bar = MenuBar::new(mtm, store);
         app.setDelegate(Some(ProtocolObject::from_ref(&*menu_bar)));
-        let status = NSStatusBar::systemStatusBar().statusItemWithLength(NSSquareStatusItemLength);
+        let status =
+            NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
         let button = status.button(mtm).expect("status item has a button");
         let name = ns_string!("doohickey");
         let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
@@ -869,8 +892,8 @@ pub fn run() -> ExitCode {
         .expect("checkmark.square is a built-in macOS symbol");
         image.setTemplate(true);
         button.setImage(Some(&image));
-        button.setToolTip(Some(name));
-        button.setAccessibilityLabel(Some(name));
+        button.setImagePosition(NSCellImagePosition::ImageLeft);
+        update_task_count(&button, &menu_bar.ivars().store.borrow());
         // The status button is the sender expected by togglePopover:.
         unsafe {
             button.setTarget(Some(&menu_bar));

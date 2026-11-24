@@ -2,7 +2,7 @@
 
 ![img](./img/pic.png)
 
-A small native style macOS menu bar checklist.
+A small native style macOS menu bar checklist. The number beside the checkmark shows how many tasks are open.
 
 - **+** to add a task
 - [x] to check/uncheck a task
@@ -33,3 +33,13 @@ Run `just install` to build and install the app in `~/Applications/doohickey.app
 Run `just startup` to install doohickey and add it to your macOS login items.
 
 Tasks are saved locally in `~/Library/Application Support/doohickey/tasks.json`.
+
+## Build an Apple silicon disk image
+
+Run `just dmg` on macOS to create `target/doohickey-arm64.dmg`. If the ARM target is missing from your Rust toolchain, install it with `rustup target add aarch64-apple-darwin` first.
+
+Open the DMG and drag **doohickey** onto **Applications**. The bundled app targets macOS 14 or later and uses an ad hoc signature for local builds.
+
+## Publish a GitHub release
+
+Push a version tag such as `v0.1.0` on the commit you want to release. GitHub Actions runs the tests on Apple silicon, builds and verifies the DMG, then publishes `doohickey-arm64.dmg` on the tag’s GitHub Release. The download uses the same ad hoc signature as the local build.
